@@ -622,7 +622,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Face lock tracking with MQTT direction publishing for ESP8266 servo control.",
     )
-    parser.add_argument("--mqtt-broker", default="157.173.101.159", help="MQTT broker host/IP.")
+    parser.add_argument("--mqtt-broker", default="broker.hivemq.com", help="MQTT broker host/IP.")
     parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port.")
     parser.add_argument(
         "--mqtt-topic",

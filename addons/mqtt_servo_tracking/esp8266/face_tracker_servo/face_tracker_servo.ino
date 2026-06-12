@@ -1,33 +1,68 @@
-#define USE_US_TIMER
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #include <PubSubClient.h>
-#include <Servo.h>
 
-// Wi-Fi settings
-const char* WIFI_SSID = "Shin";
-const char* WIFI_PASSWORD = "password";
+const char* WIFI_SSID     = "EdNet";
+const char* WIFI_PASSWORD = "Huawei@123";
 
-// MQTT settings
-const char* MQTT_SERVER = "157.173.101.159";
-const uint16_t MQTT_PORT = 1883;
-const char* MQTT_TOPIC = "vision/teamalpha/movement";
-const char* MQTT_CLIENT_ID = "teamalpha-face-servo";
+const char* MQTT_SERVER    = "157.173.101.159";
+const uint16_t MQTT_PORT   = 1883;
+const char* MQTT_TOPIC     = "vision/team213_ange/movement";
+const char* MQTT_CLIENT_ID = "esp32_team213_ange";
 
-// Servo configuration
-const uint8_t SERVO_PIN = 14; // D5
-const int SERVO_MIN_ANGLE = 0;
-const int SERVO_MAX_ANGLE = 180;
-const int SERVO_CENTER_ANGLE = 90;
-const int TRACK_STEP = 1;
-const int SEARCH_STEP = 2;
-const unsigned long TRACK_INTERVAL_MS = 55;
-const unsigned long SEARCH_INTERVAL_MS = 70;
-const unsigned long COMMAND_TIMEOUT_MS = 800;
+#define SERVO_PIN  18
+#define LEDC_CHAN  0
+#define LEDC_FREQ  50
+#define LEDC_RES   16
 
-const bool REVERSE_SERVO = true;
+const int SERVO_MIN    = 0;
+const int SERVO_MAX    = 180;
+const int SERVO_CENTER = 90;
+const int TRACK_STEP   = 2;
+const int SEARCH_STEP  = 2;
 
-enum MovementCommand {
-  CMD_IDLE,
+const unsigned long TRACK_INTERVAL  = 55;
+const unsigned long SEARCH_INTERVAL = 70;
+const unsigned long CMD_TIMEOUT     = 800;
+
+uint32_t angleToDuty(int angle) {
+  angle = constrain(angle, SERVO_MIN, SERVO_MAX);
+
+  long pulseUs = map(angle, 0, 180, 500, 2400);
+
+  return (uint32_t)((pulseUs * 65535UL) / 20000UL);
+}
+
+void servoBegin() {
+
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+
+  ledcAttach(SERVO_PIN, LEDC_FREQ, LEDC_RES);
+
+#else
+
+  ledcSetup(LEDC_CHAN, LEDC_FREQ, LEDC_RES);
+  ledcAttachPin(SERVO_PIN, LEDC_CHAN);
+
+#endif
+}
+
+void servoWrite(int angle) {
+
+  uint32_t duty = angleToDuty(angle);
+
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3,0,0)
+
+  ledcWrite(SERVO_PIN, duty);
+
+#else
+
+  ledcWrite(LEDC_CHAN, duty);
+
+#endif
+}
+
+enum Cmd {
+  IDLE,
   CMD_LEFT,
   CMD_RIGHT,
   CMD_CENTER,
@@ -36,173 +71,223 @@ enum MovementCommand {
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
-Servo panServo;
 
-MovementCommand currentCommand = CMD_IDLE;
-int servoAngle = SERVO_CENTER_ANGLE;
-int sweepDirection = 1;
-unsigned long lastMoveAt = 0;
-unsigned long lastReconnectAttempt = 0;
-unsigned long lastCommandAt = 0;
+Cmd currentCmd = CMD_SEARCH;
 
-// --- Core Logic ---
+int servoAngle = SERVO_CENTER;
+int sweepDir   = 1;
 
-void setServoAngle(int angle) {
-  angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
-  servoAngle = angle;
-  panServo.write(servoAngle);
-}
-
-void applyTrackingStep(int logicalDirection) {
-  int direction = REVERSE_SERVO ? -logicalDirection : logicalDirection;
-  setServoAngle(servoAngle + (direction * TRACK_STEP));
-}
-
-MovementCommand parseCommand(String message) {
-  message.trim();
-  message.toUpperCase();
-
-  // Strip "CMD_" prefix if the user types it in Serial
-  if (message.startsWith("CMD_")) {
-    message = message.substring(4);
-  }
-
-  if (message == "LEFT") return CMD_LEFT;
-  if (message == "RIGHT") return CMD_RIGHT;
-  if (message == "CENTER") return CMD_CENTER;
-  if (message == "SEARCH") return CMD_SEARCH;
-  return CMD_IDLE;
-}
-
-// --- Inputs (MQTT & Serial) ---
+unsigned long lastMoveAt   = 0;
+unsigned long lastReconnAt = 0;
+unsigned long lastCmdAt    = 0;
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String message = "";
+
+  String msg = "";
+
   for (unsigned int i = 0; i < length; i++) {
-    message += (char)payload[i];
+    msg += (char)payload[i];
   }
 
-  currentCommand = parseCommand(message);
-  lastCommandAt = millis();
+  Serial.print("[MQTT] ");
+  Serial.println(msg.substring(0, 80));
 
-  Serial.print("[MQTT] Recieved: ");
-  Serial.println(message);
-}
-
-void handleSerial() {
-  if (Serial.available() > 0) {
-    String input = Serial.readStringUntil('\n');
-    MovementCommand newCmd = parseCommand(input);
-    
-    // Only update if it's a valid movement command to avoid accidental idles
-    if (newCmd != CMD_IDLE || input.indexOf("IDLE") >= 0) {
-      currentCommand = newCmd;
-      lastCommandAt = millis();
-      Serial.print("[SERIAL] Executing: ");
-      Serial.println(input);
-    }
+  if (msg.indexOf("MOVE_LEFT") >= 0) {
+    currentCmd = CMD_LEFT;
   }
-}
+  else if (msg.indexOf("MOVE_RIGHT") >= 0) {
+    currentCmd = CMD_RIGHT;
+  }
+  else if (msg.indexOf("CENTERED") >= 0) {
+    currentCmd = CMD_CENTER;
+  }
+  else if (msg.indexOf("NO_FACE") >= 0) {
+    currentCmd = CMD_SEARCH;
+  }
+  else {
+    currentCmd = IDLE;
+  }
 
-// --- Networking ---
+  lastCmdAt = millis();
+}
 
 void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
 
-  Serial.print("[WiFi] Connecting");
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(WIFI_SSID);
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+  unsigned long t = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
     delay(500);
     Serial.print(".");
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Connected");
+    Serial.println("\n[WiFi] Connected!");
   } else {
-    Serial.println("\n[WiFi] Failed");
+    Serial.println("\n[WiFi] FAILED");
   }
 }
 
 bool connectMqtt() {
-  if (mqttClient.connected()) return true;
 
-  if (millis() - lastReconnectAttempt < 5000) return false;
-  lastReconnectAttempt = millis();
+  if (mqttClient.connected()) {
+    return true;
+  }
 
-  Serial.print("[MQTT] Connecting...");
-  if (!mqttClient.connect(MQTT_CLIENT_ID)) {
-    Serial.print(" Failed, rc=");
-    Serial.println(mqttClient.state());
+  if (millis() - lastReconnAt < 5000) {
     return false;
   }
 
-  Serial.println(" Connected");
-  mqttClient.subscribe(MQTT_TOPIC);
-  return true;
-}
+  lastReconnAt = millis();
 
-// --- Servo Handling ---
+  Serial.print("[MQTT] Connecting...");
+
+  if (mqttClient.connect(MQTT_CLIENT_ID)) {
+
+    Serial.println("OK");
+
+    mqttClient.subscribe(MQTT_TOPIC);
+
+    Serial.print("[MQTT] Subscribed: ");
+    Serial.println(MQTT_TOPIC);
+
+    return true;
+  }
+
+  Serial.print("FAILED rc=");
+  Serial.println(mqttClient.state());
+
+  return false;
+}
 
 void handleServo() {
+
   unsigned long now = millis();
 
-  // Auto-idle if no command received within timeout
-  if ((now - lastCommandAt) > COMMAND_TIMEOUT_MS) {
-    currentCommand = CMD_IDLE;
+  if ((now - lastCmdAt) > CMD_TIMEOUT) {
+    currentCmd = CMD_SEARCH;
   }
 
-  if (currentCommand == CMD_CENTER) {
-    setServoAngle(SERVO_CENTER_ANGLE);
-    currentCommand = CMD_IDLE; // Reset after centering
+  if (currentCmd == CMD_CENTER) {
+
+    servoAngle = SERVO_CENTER;
+
+    servoWrite(servoAngle);
+
+    currentCmd = IDLE;
+
+    Serial.println("[SERVO] Centered");
+
     return;
   }
 
-  if (currentCommand == CMD_SEARCH) {
-    if (now - lastMoveAt < SEARCH_INTERVAL_MS) return;
+  if (currentCmd == CMD_SEARCH) {
+
+    if (now - lastMoveAt < SEARCH_INTERVAL) {
+      return;
+    }
+
     lastMoveAt = now;
-    
-    setServoAngle(servoAngle + (sweepDirection * SEARCH_STEP));
-    if (servoAngle >= SERVO_MAX_ANGLE) sweepDirection = -1;
-    if (servoAngle <= SERVO_MIN_ANGLE) sweepDirection = 1;
+
+    servoAngle = constrain(
+      servoAngle + sweepDir * SEARCH_STEP,
+      SERVO_MIN,
+      SERVO_MAX
+    );
+
+    servoWrite(servoAngle);
+
+    if (servoAngle >= SERVO_MAX) {
+      sweepDir = -1;
+    }
+
+    if (servoAngle <= SERVO_MIN) {
+      sweepDir = 1;
+    }
+
     return;
   }
 
-  // Tracking Logic (LEFT/RIGHT)
-  if (now - lastMoveAt < TRACK_INTERVAL_MS) return;
+  if (now - lastMoveAt < TRACK_INTERVAL) {
+    return;
+  }
+
   lastMoveAt = now;
 
-  if (currentCommand == CMD_LEFT) applyTrackingStep(-1);
-  else if (currentCommand == CMD_RIGHT) applyTrackingStep(1);
+  if (currentCmd == CMD_LEFT) {
+
+    servoAngle = constrain(
+      servoAngle - TRACK_STEP,
+      SERVO_MIN,
+      SERVO_MAX
+    );
+
+    servoWrite(servoAngle);
+
+    Serial.print("[SERVO] Left ");
+    Serial.println(servoAngle);
+  }
+
+  else if (currentCmd == CMD_RIGHT) {
+
+    servoAngle = constrain(
+      servoAngle + TRACK_STEP,
+      SERVO_MIN,
+      SERVO_MAX
+    );
+
+    servoWrite(servoAngle);
+
+    Serial.print("[SERVO] Right ");
+    Serial.println(servoAngle);
+  }
 }
 
-// --- Main ---
-
 void setup() {
-  Serial.begin(115200);
-  delay(10);
-  Serial.println("\n[SYS] Team Alpha Face-Servo Initializing...");
 
-  panServo.attach(SERVO_PIN);
-  setServoAngle(SERVO_CENTER_ANGLE);
+  Serial.begin(115200);
+
+  delay(500);
+
+  Serial.println("\n[SYS] BENAX ESP32 — team213_ange");
+
+  servoBegin();
+
+  servoWrite(SERVO_CENTER);
+
+  Serial.println("[SERVO] GPIO 18, centered at 90");
 
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+
   mqttClient.setCallback(mqttCallback);
 
   connectWiFi();
-  lastCommandAt = millis();
+
+  lastCmdAt = millis();
 }
 
 void loop() {
-  // Ensure connectivity
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  if (!mqttClient.connected()) connectMqtt();
-  
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!mqttClient.connected()) {
+    connectMqtt();
+  }
+
   mqttClient.loop();
-  handleSerial(); // New: Listen for Serial Monitor commands
+
   handleServo();
-  
-  yield();
+
+  delay(1);
 }
